@@ -1,8 +1,6 @@
 import torch
 global EPS
-EPS=1e-12
-from liegroups.torch.so3 import SO3
-from liegroups.torch.se3 import SE3
+EPS = 1e-12
 
 
 def so3_wedge(phi):
@@ -45,61 +43,39 @@ def so3_log(R):
 
     batch_size = R.size(0)
 
-    # The rotation axis (not unit-length) is given by
+    # Skew-symmetric part gives axis * 2 * sin(angle)
     axes = R.new(batch_size, 3).zero_()
-
     axes[:,0] = R[:, 2, 1] - R[:, 1, 2]
     axes[:,1] = R[:, 0, 2] - R[:, 2, 0]
     axes[:,2] = R[:, 1, 0] - R[:, 0, 1]
 
+    sin_angles = 0.5 * vec_norms(axes)                 # [N,1]
+    cos_angles = (0.5 * batch_trace(R) - 0.5)          # [N,1]
 
-    # The sine of the rotation angle is half the norm of the axis
-    # This does not work well??
-    #sin_angles = 0.5 * vec_norms(axes)
-    #angles = torch.atan2(sin_angles, cos_angles)
+    # atan2 is smooth everywhere (unlike acos which has infinite gradient at ±1)
+    angles = torch.atan2(sin_angles, cos_angles)        # [N,1]
 
-    # The cosine of the rotation angle is related to the trace of C
-
-    #NOTE: clamp ensures that we don't get any nan's due to out of range numerical errors
-    angles = torch.acos((0.5 * batch_trace(R) - 0.5).clamp(-1+EPS,1-EPS))
-    sin_angles = torch.sin(angles)
-    
-    
-
-    # If angle is close to zero, use first-order Taylor expansion
     small_angles_mask = angles.lt(EPS).view(-1)
     small_angles_num = small_angles_mask.sum()
-
-    #This tensor is used to extract the 3x3 R's that correspond to small angles
     small_angles_indices = small_angles_mask.nonzero().squeeze()
 
-
-    #print('small angles: {}/{}.'.format(small_angles_num, batch_size))
-
     if small_angles_num == 0:
-        #Regular log
-        ax_sin = axes / sin_angles.expand_as(axes)
-        logs = 0.5 * angles.expand_as(ax_sin) * ax_sin
-
+        ax_sin = axes / (2.0 * sin_angles).clamp(min=EPS).expand_as(axes)
+        logs = angles.expand_as(ax_sin) * ax_sin
     elif small_angles_num == batch_size:
-        #Small angle Log
         I = R.new(3, 3).zero_()
         I[0,0] = I[1,1] = I[2,2] = 1.0
-        I = I.expand(batch_size, 3,3) #I is now batch_sizex3x3
+        I = I.expand(batch_size, 3, 3)
         logs = so3_vee(R - I)
     else:
-        #Some combination of both
+        ax_sin = axes / (2.0 * sin_angles).clamp(min=EPS).expand_as(axes)
+        logs = angles.expand_as(ax_sin) * ax_sin
+
         I = R.new(3, 3).zero_()
         I[0,0] = I[1,1] = I[2,2] = 1.0
-        I = I.expand(small_angles_num, 3,3) #I is now small_angles_numx3x3
-
-        ax_sin = (axes / sin_angles.expand_as(axes))
-        logs = 0.5 * angles.expand_as(ax_sin) * ax_sin
-
-
+        I = I.expand(small_angles_num, 3, 3)
         small_logs = so3_vee(R[small_angles_indices] - I)
         logs[small_angles_indices] = small_logs
-
 
     return logs
 
@@ -330,7 +306,7 @@ def se3_wedge(xi):
     Phi = so3_wedge(phi)
 
     Xi[:, 0:3, 0:3] = Phi
-    Xi[:, 0:3, 3:4] = rho
+    Xi[:, 0:3, 3] = rho
     
     return Xi
 

@@ -1,14 +1,11 @@
 import pickle, csv, glob, os
 import shutil
-import pykitti
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from lie_algebra import se3_log, so3_log
-from liegroups.numpy import SE3, SO3
-from pyslam.metrics import TrajectoryMetrics
 
 
 class KITTIData(object):
@@ -251,6 +248,9 @@ def save_checkpoint(state, is_best, save_path, epoch, seq, save_every_N=None):
 
 
 def compute_corrected_stats(tm_mat_path, predictions, targets, p_idx_delta, corr_type='rotation', output_tm_mat_path=None, eval_type='validation'):
+    # Local import so that utils can be used without pyslam installed
+    from pyslam.metrics import TrajectoryMetrics
+
     #Load original trajectory
 
     tm_orig = TrajectoryMetrics.loadmat(tm_mat_path)
@@ -446,7 +446,9 @@ def mean_log_square(tm):
     return mean_trans_loss/num_quads,  mean_rot_loss/num_quads
 
 def read_dataset(kitti_config, trial_str):
-    
+    # Local import so that utils can be used without pyslam installed
+    from pyslam.metrics import TrajectoryMetrics
+
     mat_files = glob.glob(kitti_config['tm_path'] + '/*.mat')
     
     for m_f in mat_files:

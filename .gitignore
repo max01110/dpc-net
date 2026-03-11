@@ -1,2 +1,6 @@
 .DS_Store
 rsync-monolith.sh
+checkpoints_swformer_split/
+checkpoints/
+logs/
+__pycache__/
