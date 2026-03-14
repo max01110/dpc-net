@@ -10,7 +10,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 
 from lie_algebra import se3_inv, se3_log, so3_log, so3_to_rpy
@@ -29,8 +29,10 @@ from net import (
 from utils import AverageMeter, save_checkpoint
 
 
-def _load_kitti_image_paths(data_root: str, sequence: str) -> List[str]:
-    seq_dir = os.path.join(data_root, sequence, "image_0")
+def _load_kitti_image_paths(
+    data_root: str, sequence: str, camera_id: int = 0
+) -> List[str]:
+    seq_dir = os.path.join(data_root, sequence, f"image_{camera_id}")
     if not os.path.isdir(seq_dir):
         raise FileNotFoundError(f"Expected KITTI images under {seq_dir}")
     # KITTI uses zero-padded frame ids
@@ -111,6 +113,8 @@ class KITTIDPCFromSWF(Dataset):
         run_type: str = "train",
         use_priors: bool = True,
         pose_deltas: List[int] = None,
+        stereo: bool = False,
+        stereo_right_camera_id: int = 1,
     ):
         super().__init__()
         assert run_type in ("train", "validate")
@@ -121,6 +125,8 @@ class KITTIDPCFromSWF(Dataset):
         self.vo_prior_root = vo_prior_root
         self.run_type = run_type
         self.use_priors = use_priors and vo_prior_root is not None
+        self.stereo = stereo
+        self.stereo_right_camera_id = stereo_right_camera_id
 
         # Paper: "For non-distorted data, we use Δp ∈ [3, 4, 5] for training, and test with Δp = 4"
         if pose_deltas is None:
@@ -142,14 +148,20 @@ class KITTIDPCFromSWF(Dataset):
 
         for seq in sequences:
             Twv_gt = _load_kitti_poses(poses_root, seq)
-            img_paths = _load_kitti_image_paths(data_root, seq)
+            img_paths_left = _load_kitti_image_paths(data_root, seq, camera_id=0)
+            if self.stereo:
+                img_paths_right = _load_kitti_image_paths(
+                    data_root, seq, camera_id=self.stereo_right_camera_id
+                )
+            else:
+                img_paths_right = img_paths_left
 
             if self.use_priors:
                 Twv_est = _load_vo_trajectory(vo_prior_root, seq)
             else:
                 Twv_est = None
 
-            n = min(len(Twv_gt), len(img_paths))
+            n = min(len(Twv_gt), len(img_paths_left), len(img_paths_right))
             if Twv_est is not None:
                 n = min(n, len(Twv_est))
             if n < 2:
@@ -159,10 +171,14 @@ class KITTIDPCFromSWF(Dataset):
                 if delta < 1 or n - delta < 1:
                     continue
                 for i in range(0, n - delta):
-                    img0 = img_paths[i]
-                    img1 = img_paths[i + delta]
+                    img0_left = img_paths_left[i]
+                    img0_right = img_paths_right[i]
+                    img1_left = img_paths_left[i + delta]
+                    img1_right = img_paths_right[i + delta]
 
-                    self.image_quads.append((img0, img0, img1, img1))
+                    self.image_quads.append(
+                        (img0_left, img0_right, img1_left, img1_right)
+                    )
 
                     T_12_gt = np.linalg.inv(Twv_gt[i]) @ Twv_gt[i + delta]
 
@@ -232,6 +248,30 @@ class KITTIDPCFromSWF(Dataset):
         )
 
         return imgs, target_rot, target_yaw, target_se3
+
+
+def _dataset_sequence_tag(dataset) -> str:
+    if hasattr(dataset, "sequence"):
+        return dataset.sequence
+    if hasattr(dataset, "dataset"):
+        return _dataset_sequence_tag(dataset.dataset)
+    return "unknown"
+
+
+def _compute_se3_precision_from_transforms(T_corr_list: List[np.ndarray]) -> torch.Tensor:
+    if len(T_corr_list) < 2:
+        return torch.eye(6, dtype=torch.float32)
+
+    T_corr_np = np.stack(T_corr_list, axis=0).astype(np.float32)
+    T_corr_t = torch.from_numpy(T_corr_np)
+    xi = se3_log(T_corr_t)
+    xi_np = xi.cpu().numpy().T
+    cov = np.cov(xi_np)
+    trace = np.trace(cov)
+    eps = 1e-6 * (trace / 6.0 if trace > 0 else 1.0)
+    cov_reg = cov + eps * np.eye(6, dtype=cov.dtype)
+    precision = np.linalg.inv(cov_reg)
+    return torch.from_numpy(precision.astype(np.float32))
 
 
 def train(
@@ -338,7 +378,7 @@ def train(
 
 
 def validate(valid_loader, model, loss_fn, precision, config, correction_type: str):
-    val_seq = valid_loader.dataset.sequence
+    val_seq = _dataset_sequence_tag(valid_loader.dataset)
     print(f"Validating with sequences {val_seq}...")
 
     batch_time = AverageMeter()
@@ -433,7 +473,7 @@ def main():
         "--data_root",
         type=str,
         default=os.environ.get("DPC_KITTI_DATA_ROOT", ""),
-        help="Root to KITTI image sequences (e.g. $SLURM_TMPDIR/sequences_jpg)",
+        help="Root to KITTI image sequences (e.g. $SLURM_TMPDIR/dataset/sequences).",
     )
     parser.add_argument(
         "--poses_root",
@@ -460,6 +500,18 @@ def main():
         nargs="+",
         default=["06"],
         help="KITTI sequence IDs used for validation.",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.0,
+        help="If > 0, ignore --val_sequences and sample this fraction of windows from --train_sequences for validation (e.g. 0.10).",
+    )
+    parser.add_argument(
+        "--split_seed",
+        type=int,
+        default=9,
+        help="Random seed used for deterministic train/val index split when --val_split > 0.",
     )
     parser.add_argument(
         "--batch_size", type=int, default=64, help="Batch size for training."
@@ -516,6 +568,17 @@ def main():
         default=4,
         help="Frame step for validation pairs. Paper uses Δp=4 for test/validation.",
     )
+    parser.add_argument(
+        "--stereo",
+        action="store_true",
+        help="Load stereo quads from image_0 (left) and image_N (right).",
+    )
+    parser.add_argument(
+        "--stereo_right_camera_id",
+        type=int,
+        default=1,
+        help="Right camera folder suffix N for image_N when --stereo is enabled.",
+    )
     args = parser.parse_args()
 
     if not args.data_root:
@@ -526,6 +589,8 @@ def main():
         raise ValueError(
             "poses_root is empty. Set --poses_root or DPC_KITTI_POSES_ROOT environment variable."
         )
+    if args.val_split < 0.0 or args.val_split >= 1.0:
+        raise ValueError("--val_split must be in [0, 1). Use 0 to disable split mode.")
 
     num_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "4"))
     system_config = {
@@ -540,7 +605,16 @@ def main():
     img_std = [0.229, 0.224, 0.225]
 
     print(f"Train sequences: {args.train_sequences}")
-    print(f"Val sequences:   {args.val_sequences}")
+    if args.val_split > 0.0:
+        if args.val_sequences:
+            print(
+                f"Val split mode enabled (val_split={args.val_split:.3f}); ignoring --val_sequences={args.val_sequences}"
+            )
+        else:
+            print(f"Val split mode enabled (val_split={args.val_split:.3f})")
+        print(f"Split seed:      {args.split_seed}")
+    else:
+        print(f"Val sequences:   {args.val_sequences}")
     print(f"Image dims:      {img_dims}")
     print(f"Data root:       {args.data_root}")
     print(f"Poses root:      {args.poses_root}")
@@ -549,7 +623,7 @@ def main():
     else:
         print("VO priors:       disabled (identity baseline).")
 
-    train_dataset = KITTIDPCFromSWF(
+    train_pool_dataset = KITTIDPCFromSWF(
         data_root=args.data_root,
         poses_root=args.poses_root,
         sequences=args.train_sequences,
@@ -560,19 +634,58 @@ def main():
         run_type="train",
         use_priors=args.use_priors,
         pose_deltas=args.pose_deltas,
+        stereo=args.stereo,
+        stereo_right_camera_id=args.stereo_right_camera_id,
     )
-    val_dataset = KITTIDPCFromSWF(
-        data_root=args.data_root,
-        poses_root=args.poses_root,
-        sequences=args.val_sequences,
-        img_dims=img_dims,
-        img_mean=img_mean,
-        img_std=img_std,
-        vo_prior_root=args.vo_prior_root if args.use_priors else None,
-        run_type="validate",
-        use_priors=args.use_priors,
-        pose_deltas=[args.val_pose_delta],
-    )
+    train_precision = train_pool_dataset.train_se3_precision
+
+    if args.val_split > 0.0:
+        total_windows = len(train_pool_dataset)
+        if total_windows < 2:
+            raise ValueError(
+                f"Need at least 2 windows for --val_split, but found {total_windows}."
+            )
+
+        val_size = max(1, int(total_windows * args.val_split))
+        if val_size >= total_windows:
+            val_size = total_windows - 1
+        train_size = total_windows - val_size
+
+        split_gen = torch.Generator()
+        split_gen.manual_seed(args.split_seed)
+        shuffled_indices = torch.randperm(total_windows, generator=split_gen).tolist()
+        val_indices = shuffled_indices[:val_size]
+        train_indices = shuffled_indices[val_size:]
+
+        train_dataset = Subset(train_pool_dataset, train_indices)
+        val_dataset = Subset(train_pool_dataset, val_indices)
+
+        train_precision = _compute_se3_precision_from_transforms(
+            [train_pool_dataset.T_corr[i] for i in train_indices]
+        )
+        val_sequence_tag = f"split{int(args.val_split * 100):02d}_seed{args.split_seed}"
+
+        print(
+            f"Validation split from train pool: {val_size}/{total_windows} windows ({val_size / total_windows:.2%})"
+        )
+        print(f"Effective train windows: {train_size}, val windows: {val_size}")
+    else:
+        train_dataset = train_pool_dataset
+        val_dataset = KITTIDPCFromSWF(
+            data_root=args.data_root,
+            poses_root=args.poses_root,
+            sequences=args.val_sequences,
+            img_dims=img_dims,
+            img_mean=img_mean,
+            img_std=img_std,
+            vo_prior_root=args.vo_prior_root if args.use_priors else None,
+            run_type="validate",
+            use_priors=args.use_priors,
+            pose_deltas=[args.val_pose_delta],
+            stereo=args.stereo,
+            stereo_right_camera_id=args.stereo_right_camera_id,
+        )
+        val_sequence_tag = "+".join(args.val_sequences)
 
     train_loader = DataLoader(
         train_dataset,
@@ -591,11 +704,11 @@ def main():
     if correction_type == "pose":
         pose_corrector_net = DeepPoseCorrectorStereoFullPose()
         loss_fn = SE3GeodesicLoss()
-        precision = train_loader.dataset.train_se3_precision
+        precision = train_precision
     elif correction_type == "rotation":
         pose_corrector_net = DeepPoseCorrectorMonoRotation()
         loss_fn = SO3GeodesicLoss()
-        precision = train_loader.dataset.train_se3_precision[3:6, 3:6].contiguous()
+        precision = train_precision[3:6, 3:6].contiguous()
     else:
         pose_corrector_net = DeepPoseCorrectorMonoYaw()
         loss_fn = nn.MSELoss()
@@ -618,12 +731,16 @@ def main():
     best_valid_loss = float("inf")
     train_output_interval = system_config["train_output_interval"]
 
+    kitti_test_seq_tag = args.kitti_test_seq
+    if args.val_split > 0.0 and args.kitti_test_seq == "06":
+        kitti_test_seq_tag = val_sequence_tag
+
     train_cfg = {
-        "kitti_test_seq": args.kitti_test_seq,
+        "kitti_test_seq": kitti_test_seq_tag,
         "batch_size": args.batch_size,
         "num_epochs": args.num_epochs,
         "optimizer": "Adam",
-        "img_type": "rgb",
+        "img_type": "stereo_gray" if args.stereo else "mono_gray",
         "lr": args.lr,
         "step_size": args.step_size,
         "correction_type": correction_type,

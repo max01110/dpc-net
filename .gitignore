@@ -4,3 +4,7 @@ checkpoints_swformer_split/
 checkpoints/
 logs/
 __pycache__/
+train_dpc_net_array.sh
+train_dpc_net_array.sh
+train_dpc_net_mono_split2.sh
+train_dpc_net_stereo_array.sh
